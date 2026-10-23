@@ -3,7 +3,7 @@ test_Ex0.py - pytest suite for Ex0.py
 
 Run from the folder that contains Ex0.py:
     python -m pytest test_Ex0.py -v
-    python -m pytest test_Ex0.py -v -m "not slow"     # skip the performance test
+    python -m pytest test_Ex0.py -v -k "not performance"   # skip the speed test
 
 Sections
     1. Data classes            (Volume, Plane, PlaneGeometry)
@@ -534,7 +534,7 @@ class TestProjectorAlgorithm:
         M = ramp_volume(12, 12, 12, np.uint8)
         proj = PlaneProjector(Volume(M))
         fwd = proj.project(make_geom([[0, 0, 4], [0, 8, 4], [8, 8, 4]]))
-        back = proj.project(make_geom([[7, 8, 4], [7, 0, 4], [-1, 0, 4]]))   # both axes reversed
+        back = proj.project(make_geom([[7, 7, 4], [7, -1, 4], [-1, -1, 4]]))  # both axes reversed
         np.testing.assert_array_equal(back, fwd[::-1, ::-1])
 
     def test_origin_translation_shifts_content(self):
@@ -649,7 +649,9 @@ class TestProjectorAlgorithm:
             a = np.array([20.0, 20, 20]) - 18 * u - 18 * w
             geom = make_geom([a, a + 36 * u, a + 36 * u + 36 * w])
             areas.append(int(proj.project(geom).sum()))
-        assert max(areas) - min(areas) <= 0.06 * max(areas)
+        ideal = math.pi * 12 ** 2        # a centred cut through a sphere is always a disc
+        for a in areas:                  # nearest-neighbour sampling allows a few % noise
+            assert a == pytest.approx(ideal, rel=0.08)
 
     # ---- scale / speed ---------------------------------------------------- #
     def test_large_flat_index_no_int32_overflow(self):
@@ -662,7 +664,6 @@ class TestProjectorAlgorithm:
             make_geom([[n - 2, n - 1, n - 1], [n - 2, n, n - 1], [n, n, n - 1]]))
         assert E.shape == (1, 2) and E[0, 0] == 66 and E[0, 1] == 77
 
-    @pytest.mark.slow
     def test_performance_500_cubed_target(self):
         """Spec target: high FPS on ~500^3 byte volumes (generous CI-safe bound)."""
         n = 500
