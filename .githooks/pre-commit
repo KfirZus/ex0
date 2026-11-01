@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs automatically before every `git commit` (after: python install_hooks.py).
+# Runs the fast suites (smoke, unit, e2e, regression). A failing test blocks the commit.
+# The slow performance/load/stress suite runs on GitHub Actions instead.
+# Emergency bypass (use sparingly):  git commit --no-verify
+
+ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$ROOT" || exit 1
+
+# Find a Python that has the project's requirements: project venv first, then the system ones.
+PY=""
+for cand in .venv/Scripts/python.exe .venv/bin/python venv/Scripts/python.exe venv/bin/python py python3 python; do
+  if [ -x "$cand" ] || command -v "$cand" >/dev/null 2>&1; then
+    if "$cand" -c "import pytest, numpy, cv2" >/dev/null 2>&1; then
+      PY="$cand"
+      break
+    fi
+  fi
+done
+
+if [ -z "$PY" ]; then
+  echo "pre-commit: no Python with pytest, numpy and opencv found." >&2
+  echo "            Install them with:  python -m pip install -r requirements-dev.txt" >&2
+  exit 1
+fi
+
+echo "pre-commit: running tests (smoke, unit, e2e, regression) with $PY ..."
+if "$PY" -m pytest -m "smoke or unit or e2e or regression" -q -x -p no:cacheprovider; then
+  echo "pre-commit: all tests passed."
+  exit 0
+fi
+echo "" >&2
+echo "pre-commit: tests FAILED - commit aborted. Fix them, or bypass once with: git commit --no-verify" >&2
+exit 1

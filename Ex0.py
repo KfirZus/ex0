@@ -12,14 +12,20 @@ Pipeline:
     3. For each plane, sample M on a regular grid spanning the plane and build
        a 2D matrix E of size Dab x Dbc (out-of-bounds samples are 0).
     4. Write every E as one frame of an MP4 video, in CSV order.
+       (The CSV is streamed twice, so memory use does not grow with the plane count.)
 
 Geometry convention (single place to change: `PlaneGeometry.from_points`):
     origin = first point (a, or a' for trapezoids)
     u      = unit vector a -> b          (rows of E,    length Dab = |ab|)
     w      = unit vector b -> c          (columns of E, length Dbc = |bc|)
     E[i, j] = M[origin + i*u + j*w]      (nearest-neighbour sampling)
-  For a trapezoid the second top vertex a'' is validated but not needed for
-  sampling, since the (a', b, c) corner already fixes the plane and its extent.
+  For a trapezoid the second top vertex a'' is not needed for sampling, since the
+  (a', b, c) corner already fixes the plane and its extent. It is only validated:
+  a line whose a'' is more than COPLANAR_TOL voxels off that plane is skipped.
+
+Bad CSV lines are skipped with a warning (the rest of the file still renders): wrong number of
+values, non-numeric text, a trapezoid that is not coplanar, a degenerate plane (identical or
+collinear points) and a plane far larger than the volume (see MAX_PLANE_SIDE_FACTOR).
 
 Coordinates in the CSV are interpreted as (x, y, z) where x is the fastest
 varying NRRD axis (the first entry of the NRRD `sizes` field).
@@ -30,6 +36,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -44,6 +51,18 @@ except ImportError:  # pragma: no cover
     cv2 = None
 
 LOG = logging.getLogger("Ex0")
+
+# A trapezoid's 4th point may lie at most this far (in voxels) from the plane of the
+# other three; CSV lines that exceed it are skipped with a warning.
+COPLANAR_TOL = 0.5
+
+# Edges shorter than this, or planes thinner than this (in voxels), are degenerate
+# (identical / collinear points) and their CSV lines are skipped with a warning.
+MIN_PLANE_SIZE = 0.5
+
+# A plane may be at most this many times the volume's diagonal long per side;
+# larger planes (typos such as 1e12) are skipped instead of exhausting memory.
+MAX_PLANE_SIDE_FACTOR = 2
 
 # --------------------------------------------------------------------------- #
 # Data model
@@ -134,12 +153,37 @@ class NrrdReader:
         skip = int(header.get("byte skip", 0))
 
         if encoding == "raw":
-            arr = np.fromfile(path, dtype=dtype, count=count, offset=offset + max(skip, 0))
+            # Check the file really holds the advertised data BEFORE allocating,
+            # so an oversized / truncated header fails fast instead of exhausting RAM.
+            start = offset + max(skip, 0)
+            have = max(0, Path(path).stat().st_size - start)
+            need = count * dtype.itemsize
+            if have < need:
+                raise ValueError(f"{path}: expected {need} data bytes "
+                                 f"({sizes[0]}x{sizes[1]}x{sizes[2]} {dtype.name}), found {have}")
+            arr = np.fromfile(path, dtype=dtype, count=count, offset=start)
         elif encoding in ("gzip", "gz"):
+            # Decompress straight into the final array (no temporary full-size copy).
+            arr = np.empty(count, dtype=dtype)
+            view = memoryview(arr).cast("B")
             with open(path, "rb") as f:
                 f.seek(offset)
-                raw = gzip.decompress(f.read())
-            arr = np.frombuffer(raw, dtype=dtype, count=count, offset=max(skip, 0))
+                with gzip.GzipFile(fileobj=f, mode="rb") as gz:
+                    to_skip = max(skip, 0)
+                    while to_skip > 0:
+                        chunk = gz.read(min(to_skip, 1 << 20))
+                        if not chunk:
+                            break
+                        to_skip -= len(chunk)
+                    got = 0
+                    while got < len(view):
+                        # Small slices: GzipFile.readinto allocates a temp buffer as big as the request.
+                        n = gz.readinto(view[got:got + (1 << 24)])
+                        if not n:
+                            break
+                        got += n
+            if got != len(view):
+                raise ValueError(f"{path}: expected {len(view)} data bytes, found {got}")
         else:
             raise ValueError(f"Unsupported NRRD encoding '{encoding}'")
 
@@ -184,31 +228,88 @@ class PlaneCsvParser:
     """Parses a CSV of planes: 9 values (triangle) or 12 values (trapezoid) per line."""
 
     @staticmethod
-    def parse(path: str) -> List[Plane]:
-        planes: List[Plane] = []
+    def iter_planes(path: str, warn: bool = True) -> Iterator[Plane]:
+        """Lazily yield valid planes, one CSV line at a time (constant memory).
+
+        Malformed lines are skipped (with a warning when `warn` is True).
+        """
         with open(path, "r", encoding="utf-8-sig") as f:
             for line_no, line in enumerate(f, 1):
-                plane = PlaneCsvParser.parse_line(line, line_no)
+                plane = PlaneCsvParser.parse_line(line, line_no, warn)
                 if plane is not None:
-                    planes.append(plane)
+                    yield plane
+
+    @staticmethod
+    def parse(path: str) -> List[Plane]:
+        """Eagerly load every valid plane (convenience wrapper over iter_planes)."""
+        planes = list(PlaneCsvParser.iter_planes(path))
         if not planes:
             raise ValueError(f"{path}: no valid planes found")
         return planes
 
     @staticmethod
-    def parse_line(line: str, line_no: int = 0) -> Optional[Plane]:
+    def parse_line(line: str, line_no: int = 0, warn: bool = True) -> Optional[Plane]:
         text = line.strip()
         if not text or text.startswith("#"):
             return None
         try:
             vals = [float(t) for t in text.replace(";", ",").replace("\t", ",").split(",") if t.strip()]
         except ValueError:
-            LOG.warning("CSV line %d skipped (non-numeric, e.g. header): %r", line_no, text[:60])
+            if warn:
+                LOG.warning("CSV line %d skipped (non-numeric, e.g. header): %r", line_no, text[:60])
             return None
         if len(vals) not in (9, 12) or not np.all(np.isfinite(vals)):
-            LOG.warning("CSV line %d skipped (expected 9 or 12 finite values, got %d)", line_no, len(vals))
+            if warn:
+                LOG.warning("CSV line %d skipped (expected 9 or 12 finite values, got %d)", line_no, len(vals))
             return None
-        return Plane(np.asarray(vals, dtype=np.float64).reshape(-1, 3), line_no)
+        points = np.asarray(vals, dtype=np.float64).reshape(-1, 3)
+        problem = PlaneCsvParser.degeneracy(points)
+        if problem:
+            if warn:
+                LOG.warning("CSV line %d skipped (degenerate plane: %s)", line_no, problem)
+            return None
+        if len(points) == 4:
+            off = PlaneCsvParser.off_plane_distance(points)
+            if off > COPLANAR_TOL:
+                if warn:
+                    LOG.warning("CSV line %d skipped (trapezoid points are not coplanar: a'' is %.2f voxels "
+                                "off the plane of a', b, c; tolerance %.2f)", line_no, off, COPLANAR_TOL)
+                return None
+        return Plane(points, line_no)
+
+    @staticmethod
+    def degeneracy(points: np.ndarray) -> Optional[str]:
+        """Return why the points do not span a real plane, or None if they do.
+
+        A plane is degenerate when an edge (a->b or b->c) is shorter than MIN_PLANE_SIZE
+        voxels, or when the three base points are (almost) on one line, i.e. the plane
+        is thinner than MIN_PLANE_SIZE voxels.
+        """
+        a, b = points[0], points[1]
+        c = points[2] if len(points) == 3 else points[3]
+        ab, bc = b - a, c - b
+        dab, dbc = float(np.linalg.norm(ab)), float(np.linalg.norm(bc))
+        if min(dab, dbc) < MIN_PLANE_SIZE:
+            return f"an edge is only {min(dab, dbc):.2f} voxels long (minimum {MIN_PLANE_SIZE})"
+        thickness = float(np.linalg.norm(np.cross(ab, bc))) / max(dab, dbc)
+        if thickness < MIN_PLANE_SIZE:
+            return (f"the points are (almost) on one line: the plane is only {thickness:.2f} "
+                    f"voxels thick (minimum {MIN_PLANE_SIZE})")
+        return None
+
+    @staticmethod
+    def off_plane_distance(points: np.ndarray) -> float:
+        """Distance (in voxels) of the 4th point a'' from the plane through a', b, c.
+
+        Returns 0.0 when a', b, c are collinear (they do not define a plane, so there is
+        nothing to compare against; the degenerate case is handled by PlaneGeometry).
+        """
+        a1, b, _, c = points
+        normal = np.cross(b - a1, c - b)
+        length = np.linalg.norm(normal)
+        if length == 0.0:
+            return 0.0
+        return float(abs(np.dot(points[2] - a1, normal)) / length)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,16 +414,38 @@ class VideoRenderer:
 # Pipeline / CLI
 # --------------------------------------------------------------------------- #
 
+def max_plane_side(shape_xyz: Tuple[int, int, int]) -> int:
+    """Longest allowed plane edge (in voxels) for a volume of this size."""
+    return int(MAX_PLANE_SIDE_FACTOR * math.ceil(math.sqrt(sum(s * s for s in shape_xyz))))
+
+
+def iter_geometries(csv_path: str, max_side: int, warn: bool = True) -> Iterator[PlaneGeometry]:
+    """Stream the CSV as sampling geometries, skipping planes larger than `max_side`."""
+    for plane in PlaneCsvParser.iter_planes(csv_path, warn):
+        geom = PlaneGeometry.from_points(plane.points)
+        if geom.rows > max_side or geom.cols > max_side:
+            if warn:
+                LOG.warning("CSV line %d skipped (plane of %d x %d voxels is larger than the %d-voxel "
+                            "limit for this volume)", plane.line_no, geom.rows, geom.cols, max_side)
+            continue
+        yield geom
+
+
 def run_pipeline(nrrd_path: str, csv_path: str, mp4_path: str, fps: float = 30.0) -> int:
     t0 = time.perf_counter()
     volume = NrrdReader.read(nrrd_path)
-    planes = PlaneCsvParser.parse(csv_path)
-    LOG.info("Loaded volume %s (%s) and %d planes in %.2fs",
-             volume.shape_xyz, volume.data.dtype, len(planes), time.perf_counter() - t0)
+    max_side = max_plane_side(volume.shape_xyz)
 
-    geoms = [PlaneGeometry.from_points(p.points) for p in planes]
-    frame_h = max(g.rows for g in geoms)       # common canvas: pad smaller planes
-    frame_w = max(g.cols for g in geoms)
+    # Pass 1 (streaming): count planes and find the largest one for the common
+    # canvas, without ever holding the whole CSV in memory.
+    n_planes = frame_h = frame_w = 0
+    for g in iter_geometries(csv_path, max_side):
+        n_planes += 1
+        frame_h, frame_w = max(frame_h, g.rows), max(frame_w, g.cols)
+    if n_planes == 0:
+        raise ValueError(f"{csv_path}: no valid planes found")
+    LOG.info("Loaded volume %s (%s) and %d planes in %.2fs",
+             volume.shape_xyz, volume.data.dtype, n_planes, time.perf_counter() - t0)
 
     vmin, vmax = float(volume.data.min()), float(volume.data.max())
     projector = PlaneProjector(volume)
@@ -332,8 +455,9 @@ def run_pipeline(nrrd_path: str, csv_path: str, mp4_path: str, fps: float = 30.0
 
     t1 = time.perf_counter()
     with VideoRenderer(mp4_path, (frame_h, frame_w), fps, vmin, vmax, volume.data.dtype) as video:
-        for geom in geoms:
-            video.add_frame(projector.project(geom))
+        # Pass 2 (streaming): project and write one plane at a time, in CSV order.
+        for g in iter_geometries(csv_path, max_side, warn=False):
+            video.add_frame(projector.project(g))
         n = video.frames
     dt = time.perf_counter() - t1
     LOG.info("Rendered %d frames in %.2fs (%.1f FPS) -> %s", n, dt, n / dt if dt else float("inf"), mp4_path)
@@ -354,6 +478,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not Path(p).is_file():
                 raise FileNotFoundError(p)
         run_pipeline(args.nrrd, args.csv, args.mp4, args.fps)
+    except MemoryError:
+        LOG.error("Insufficient Memory / Unsupported Size: the volume is too large to load on this machine")
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         LOG.error("%s", exc)
         return 1
