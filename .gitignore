@@ -1,0 +1,32 @@
+# PyCharm / editor settings
+.idea/
+.vscode/
+*.iml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test and coverage output
+.coverage
+coverage.xml
+htmlcov/
+
+# Generated output (videos from running Ex0.py)
+out/
+*.mp4
+
+# Large generated test data - recreate with: python generate_fixtures.py
+fixtures/
+fixture_vol_*.nrrd
+fixture_traj_stress_*.csv
+
+# OS junk
+.DS_Store
+Thumbs.db
